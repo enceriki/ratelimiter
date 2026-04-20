@@ -1,0 +1,1025 @@
+================================================================================
+  PANDUAN FRAMEWORK RATE LIMITER PHP — UNTUK AI ASSISTANT
+================================================================================
+
+Dokumen ini adalah petunjuk komprehensif mengenai PHP Rate Limiter Library
+yang dapat di-copy paste ke Claude, ChatGPT, DeepSeek, atau AI Lainnya
+agar AI dapat memahami dan membantu pengembangan framework ini.
+
+================================================================================
+BAGIAN 1: OVERVIEW UMUM
+================================================================================
+
+NAMA PROJECT: PHP Rate Limiter — Library Anti-Penyalahgunaan API/Form
+VERSION: Solusi 2 (Key Isolation per Algoritma)
+BAHASA: PHP 8.2+
+DEPENDENCY: ZERO (tidak perlu eksternal library)
+LICENSE: Bebas digunakan (no license restriction)
+
+TUJUAN:
+  Melindungi aplikasi web dari:
+  - Brute-force attack (login berulang)
+  - DDoS Layer 7 (banyak request dari satu/banyak IP)
+  - Abuse API public
+  - Spam form submission
+  - Excessive file upload
+
+KARAKTERISTIK UNIK:
+  ✓ Dual-algorithm support (timestamp + dual-counter)
+  ✓ Multi-storage backend (FileStorage, Redis, APCu, Hybrid)
+  ✓ Algoritma berbeda = key berbeda di storage (Solusi 2)
+  ✓ Per-file isolation via key_prefix (mencegah tabrakan demo files)
+  ✓ Circuit breaker dengan fallback otomatis (HybridStorage)
+  ✓ 195/195 test lulus, production-ready
+
+================================================================================
+BAGIAN 2: ARSITEKTUR DASAR
+================================================================================
+
+FOLDER STRUKTUR:
+  RateLimiter/
+  ├── autoload.php              # PSR-style loader (no Composer needed)
+  ├── demo.php                  # Demo interaktif
+  ├── cron-gc.php               # Garbage collector CLI
+  ├── test.php                  # 195 test suite
+  ├── src/
+  │   ├── RateLimiter.php       # Core engine + 2 algoritma
+  │   ├── Storage.php           # 5 driver storage
+  │   ├── RateLimitMiddleware.php # Framework-agnostic middleware
+  │   └── SecurityHelper.php    # IP normalization, CIDR, safeAttempt
+  └── temp/                     # FileStorage data folder (auto-created)
+
+CORE CLASSES:
+  1. RateLimiter
+     - attempt($id, $limit, $window, $cost, $algo)  → increment + check
+     - check($id, $limit, $window, $algo)           → check only
+     - block($id, $seconds)                          → manual block + audit log
+     - isBlocked($id)                                → cek blokir
+     - reset($id)                                    → hapus counter
+     - resetAll($id)                                 → hapus counter + unblock
+     - getRemaining()                                → sisa kuota
+     - getRetryAfter()                               → detik tunggu
+     - getResetAt()                                  → unix timestamp reset
+
+  2. Storage Drivers
+     - FileStorage($dir, $gcDivisor, $maxFiles)
+     - RedisStorage($redis)
+     - ApcuStorage()
+     - HybridStorage($primary, $fallback, $onDegrade, $onRecover, $retryInterval)
+     - ArrayStorage()  [testing only]
+
+  3. SecurityHelper (static methods)
+     - clientIp($trustProxy, $trustedCidrs)
+     - normalizeIp($ip)
+     - ipInList($ip, $cidrs)
+     - safeAttempt($limiter, $id, $limit, $win, $cost, $failOpen, $cb)
+     - checkWithCaptcha($limiter, $id, $hardLimit, $softLimit, $window)
+     - globalAttempt($limiter, $endpoint, $limit, $window)
+
+================================================================================
+BAGIAN 3: DUA ALGORITMA YANG DIDUKUNG
+================================================================================
+
+ALGORITMA 1: TIMESTAMP (O(n)) — AKURAT, HARD BLOCKING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Cara Kerja:
+  Simpan timestamp setiap request dalam array di storage.
+  Saat check: hitung request dalam window dengan array_filter().
+  Jika sudah exceed → tolak keras, tidak ada estimasi.
+
+Struktur Data:
+  {
+    "requests": [1713456789, 1713456790, 1713456791],
+    "window": 60,
+    "created_at": 1713456789
+  }
+
+Kelebihan:
+  ✓ Akurat 100% — hard blocking di limit yang tepat
+  ✓ retry_after dijamin akurat (user tahu kapan bisa coba lagi)
+  ✓ Cocok untuk keamanan kritis (login, OTP, transfer uang)
+  ✓ Tidak ada "ghost quota" — user bisa masuk persis setelah retry_after
+
+Kekurangan:
+  ✗ O(n) complexity — lambat di limit besar (>100)
+  ✗ Batas limit max 500 (enforced by validateInputs)
+  ✗ I/O disk berat (simpan array besar di FileStorage)
+  ✗ Tidak cocok untuk traffic tinggi (>500 req/menit)
+
+Contoh Penggunaan:
+  $limiter = new RateLimiter($storage, ['algorithm' => 'timestamp']);
+  if (!$limiter->attempt('login:' . $ip . ':' . $email, 5, 900)) {
+      die("Login tercoba 5x dalam 15 menit. Tunggu " . 
+          $limiter->getRetryAfter() . " detik");
+  }
+
+Best For:
+  - Login form (5x / 15 menit)
+  - OTP verification (3x / 5 menit)
+  - Password reset (3x / 1 jam)
+  - Sensitive actions (transfer, delete account)
+  - Form submission dengan nilai rendah
+
+
+ALGORITMA 2: DUAL-COUNTER (O(1)) — RINGAN, ESTIMASI
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Cara Kerja:
+  Buat "slot" per window, catat request di slot current + previous.
+  Hanya simpan 3 integer: {slot, prev_count, curr_count}.
+  Saat check: hitung prev + curr, tidak ada array filtering.
+
+Struktur Data:
+  {
+    "slot": 5,          # window slot index (calculated from time)
+    "prev": 2,          # request di window sebelumnya
+    "curr": 4           # request di window sekarang
+  }
+
+Kelebihan:
+  ✓ O(1) complexity — sangat cepat, ideal untuk traffic tinggi
+  ✓ Tidak ada batas limit (bisa 1000, 10000, atau lebih)
+  ✓ I/O minimal (hanya 3 integer)
+  ✓ Cocok untuk API publik dengan traffic tinggi
+  ✓ Redis-friendly (kecepatan maksimal)
+
+Kekurangan:
+  ✗ Akurasi ±1 request di boundary window (toleransi built-in)
+  ✗ retry_after hanya "perkiraan" — user bisa lolos sebelum expired
+  ✗ Tidak cocok untuk keamanan kritis (gunakan timestamp)
+  ✗ "Ghost quota" bisa terjadi saat window berubah
+
+Contoh Penggunaan:
+  $limiter = new RateLimiter($storage, ['algorithm' => 'dual-counter']);
+  if (!$limiter->attempt('api:' . $ip, 1000, 60)) {
+      http_response_code(429);
+      die(json_encode(['error' => 'Rate limit exceeded']));
+  }
+
+Best For:
+  - API publik read (baca data, pencarian)
+  - High-traffic endpoints
+  - Dashboard public (berita, katalog)
+  - Search/filter dengan pagination
+  - Logging/analytics endpoint
+  - Traffic > 500 req/menit
+
+
+PERBANDINGAN CEPAT:
+┌─────────────────┬──────────────────┬─────────────────┐
+│ Aspek           │ Timestamp        │ Dual-Counter    │
+├─────────────────┼──────────────────┼─────────────────┤
+│ Kompleksitas    │ O(n)             │ O(1)            │
+│ Akurasi         │ Tepat 100%       │ ±1 request      │
+│ Max Limit       │ 500              │ Unlimited       │
+│ retry_after     │ Akurat           │ Perkiraan       │
+│ Best Traffic    │ < 100 req/menit  │ > 500 req/min   │
+│ Storage         │ Array            │ 3 int           │
+│ Keamanan        │ High             │ Medium          │
+│ Kecepatan       │ Sedang           │ Sangat Cepat    │
+│ Cocok Untuk     │ Login, OTP       │ API, Dashboard  │
+└─────────────────┴──────────────────┴─────────────────┘
+
+================================================================================
+BAGIAN 4: SOLUSI 2 — ISOLASI KEY PER ALGORITMA (BUG FIX)
+================================================================================
+
+PROBLEM ASLI:
+Ketika demo3.php (dual-counter) dan demo2.php (timestamp) menggunakan
+identifier yang SAMA (IP ::1 localhost), keduanya menulis/baca ke KEY
+yang SAMA di storage:
+
+  demo3.php (dual-counter) → key: "rl:sha256(login:::1:hash)"
+                          → simpan: {slot: 5, curr: 2}
+  
+  demo2.php (timestamp) → key: "rl:sha256(login:::1:hash)"  ← SAMA!
+                       → baca: {slot: 5, curr: 2}
+                       → cari field 'requests'? TIDAK ADA!
+                       → array_filter(null) → FATAL ERROR
+
+SOLUSI: PREFIX ALGORITMA DI DALAM HASH INPUT
+
+  Modifikasi buildKey() agar menerima parameter ?$algo:
+  
+  OLD: buildKey($identifier)
+       return "{$prefix}:sha256($identifier)"
+  
+  NEW: buildKey($identifier, ?$algo)
+       $toHash = $algo ? "{$algo}|{$identifier}" : $identifier
+       return "{$prefix}:sha256($toHash)"
+
+HASIL:
+  demo3.php (dual-counter) → buildKey('login:::1:hash', 'dc')
+                          → "demo3:sha256(dc|login:::1:hash)"
+  
+  demo2.php (timestamp)   → buildKey('login:::1:hash', 'ts')
+                          → "demo2:sha256(ts|login:::1:hash)"  ← BERBEDA!
+
+IMPLEMENTASI DI KODE:
+  Setiap method counter melewatkan algo prefix:
+  
+  private function attemptTimestamp(...) {
+      $key = $this->buildKey($identifier, self::KEY_PREFIX_TIMESTAMP);
+      // ... rest of code
+  }
+  
+  private function attemptDualCounter(...) {
+      $key = $this->buildKey($identifier, self::KEY_PREFIX_DUAL_COUNTER);
+      // ... rest of code
+  }
+  
+  Method block/unblock/isBlocked TIDAK melewatkan algo (universal).
+
+MANFAAT:
+  ✓ Data dual-counter tidak pernah terbaca oleh timestamp
+  ✓ Key file yang berbeda tidak saling tabrakan
+  ✓ Setiap algoritma punya "ruang" sendiri di storage
+  ✓ Dapat switch algoritma di tengah jalan tanpa crash
+  ✓ reset() membersihkan KEDUA algoritma sekaligus
+
+TEST COVERAGE:
+  Suite 31 (17 test) membuktikan:
+  - Timestamp setelah dual-counter pada identifier sama → tidak error
+  - Key DC dan TS benar-benar berbeda di storage
+  - Format data tidak pernah bercampur
+  - Counter independen
+  - block() tetap universal
+  - reset() hapus keduanya
+
+================================================================================
+BAGIAN 5: STORAGE DRIVERS
+================================================================================
+
+FILESTORAGE (Rekomendasi untuk Shared Hosting / Development)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Usage:
+    $storage = new FileStorage(
+        dir:       __DIR__ . '/temp',
+        gcDivisor: 50,      // GC 2% per request
+        maxFiles:  5_000
+    );
+  
+  Karakteristik:
+    - Menyimpan file JSON di folder /temp/
+    - Multi-server: TIDAK (hanya single server)
+    - Kecepatan: ⭐⭐ (I/O disk)
+    - Rekomendasi: < 500 req/menit
+    - GC: Probabilistik saat ada request + cron-gc.php
+    - Proteksi: .htaccess Deny from all (otomatis)
+  
+  Keuntungan:
+    ✓ Zero dependency
+    ✓ Tidak perlu Redis
+    ✓ Mudah debug (buka folder, lihat file)
+    ✓ Cocok shared hosting
+  
+  Kekurangan:
+    ✗ I/O disk bottleneck di traffic tinggi
+    ✗ Tidak bisa multi-server
+    ✗ File menumpuk jika traffic rendah (perlu cron-gc)
+
+
+REDISSTORAGE (Rekomendasi untuk Production / Multi-Server)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Usage:
+    $redis = new Redis();
+    $redis->connect('127.0.0.1', 6379);
+    $storage = new RedisStorage($redis);
+  
+  Karakteristik:
+    - In-memory key-value store
+    - Multi-server: YA (cluster support)
+    - Kecepatan: ⭐⭐⭐⭐⭐ (memory access)
+    - Rekomendasi: > 1000 req/menit
+    - TTL: Otomatis via Redis EXPIRE
+    - GC: Tidak perlu (Redis handle sendiri)
+  
+  Keuntungan:
+    ✓ Kecepatan maksimal
+    ✓ Multi-server support
+    ✓ Atomic operations
+    ✓ Built-in TTL/expiration
+    ✓ Cocok production high-traffic
+  
+  Kekurangan:
+    ✗ Perlu Redis server terpisah
+    ✗ Jika Redis down, rate limit tidak jalan
+
+
+HYBRIDSTORAGE (Rekomendasi untuk Production dengan Fallback)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Usage:
+    $storage = new HybridStorage(
+        primary:       new RedisStorage($redis),
+        fallback:      new FileStorage('/var/tmp/rl'),
+        onDegrade:     fn() => error_log('Redis down'),
+        onRecover:     fn() => error_log('Redis recovered'),
+        retryInterval: 30
+    );
+  
+  Cara Kerja:
+    - Coba primary (Redis) dulu
+    - Jika gagal → switch ke fallback (FileStorage)
+    - Setiap 30 detik, coba kembali ke primary
+    - Jika primary pulih → switch otomatis
+    - Callbacks dipanggil saat downgrade/recover
+  
+  Karakteristik:
+    - Circuit Breaker pattern
+    - State: CLOSED (normal) → OPEN (primary down) → HALF-OPEN → CLOSED
+    - Multi-server: YA (via Redis)
+    - Resilience: TINGGI
+  
+  Keuntungan:
+    ✓ Fallback otomatis jika Redis mati
+    ✓ No service disruption
+    ✓ Monitoring built-in
+    ✓ Production-grade reliability
+  
+  Kekurangan:
+    ✗ Lebih kompleks setup
+    ✗ Dua storage = two points of failure
+
+
+APCUSTORAGE (Rekomendasi untuk Single Server Dengan APCu Extension)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Usage:
+    $storage = new ApcuStorage();
+  
+  Karakteristik:
+    - Shared memory antar PHP processes
+    - Kecepatan: ⭐⭐⭐⭐ (memory, tapi tidak seoptimal Redis)
+    - TTL: Via apcu_entry()
+    - Rekomendasi: Single server, < 1000 req/menit
+  
+  Keuntungan:
+    ✓ No external dependency
+    ✓ Cepat (memory-based)
+    ✓ Cocok single server
+  
+  Kekurangan:
+    ✗ Butuh extension APCu
+    ✗ Tidak multi-server
+    ✗ Reset saat PHP restart
+
+
+ARRAYSTORAGE (Testing Only)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Usage:
+    $storage = new ArrayStorage();  // Hanya di unit test
+  
+  Catatan:
+    - Simpan data di PHP array (memory saja)
+    - Reset setiap request (tidak persist)
+    - Hanya untuk testing/demo
+
+================================================================================
+BAGIAN 6: KEY ISOLATION — DUA LAPIS
+================================================================================
+
+LAPIS 1: KEY_PREFIX (Isolasi Antar File)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Masalah:
+    demo.php, demo2.php, demo3.php semua di folder yang sama
+    Semua menggunakan IP localhost ::1 sebagai identifier
+    → Bisa tabrakan kalau menggunakan key_prefix yang sama
+  
+  Solusi:
+    const DEMO_KEY_PREFIX = 'demo1';  // di demo.php
+    const DEMO_KEY_PREFIX = 'demo2';  // di demo2.php
+    const DEMO_KEY_PREFIX = 'demo3';  // di demo3.php
+    
+    $limiter = new RateLimiter($storage, [
+        'key_prefix' => DEMO_KEY_PREFIX,
+        'algorithm'  => $algo
+    ]);
+  
+  Hasil:
+    demo.php  → key_prefix='demo1' → "demo1:sha256(...)"
+    demo2.php → key_prefix='demo2' → "demo2:sha256(...)"
+    demo3.php → key_prefix='demo3' → "demo3:sha256(...)"
+    
+    Meskipun identifier sama, key berbeda → tidak tabrakan!
+
+
+LAPIS 2: ALGORITMA PREFIX (Isolasi Antar Algoritma)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Masalah:
+    Satu file bisa switch algoritma atau pakai dua algoritma sekaligus
+    → dual-counter dan timestamp bisa menulis ke key yang sama
+  
+  Solusi:
+    buildKey($identifier, ?$algo)
+    
+    Timestamp: buildKey('login:::1', 'ts')
+               → sha256('ts|login:::1')
+    
+    DualCounter: buildKey('login:::1', 'dc')
+                 → sha256('dc|login:::1')
+  
+  Hasil:
+    Key berbeda meskipun identifier persis sama!
+    "demo1:sha256(ts|login:::1)" ← timestamp
+    "demo1:sha256(dc|login:::1)" ← dual-counter
+
+
+KOMBINASI KEDUA LAPIS:
+  Key final: {key_prefix}:sha256({algo_prefix}|{identifier})
+  
+  Contoh:
+    demo.php file2 dengan timestamp:
+      "demo1:sha256(ts|login:::1:abc123)"
+    
+    demo2.php file2 dengan dual-counter:
+      "demo2:sha256(dc|login:::1:abc123)"
+    
+    Keduanya 100% berbeda → TIDAK PERNAH TABRAKAN
+
+================================================================================
+BAGIAN 7: IDENTIFIKASI ENDPOINT & RATE LIMIT
+================================================================================
+
+IDENTIFIKASI MINIMAL (HANYA IP):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+  
+  attempt('api:' . $ip, 100, 60);
+  
+  Kelebihan:
+    ✓ Sederhana
+    ✓ Cepat
+  
+  Kekurangan:
+    ✗ NAT: Semua user di jaringan yang sama → 1 IP public
+      → Jika A limit tercapai, B juga kena limit (unfair)
+    ✗ Proxy: X-Forwarded-For bisa dipalsukan
+    ✗ Shared hosting: IP user bisa berubah-ubah
+    ✗ Mobile: User switch WiFi/4G → IP berubah
+
+
+IDENTIFIKASI MEDIUM (IP + User ID):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  $userId = $_SESSION['user_id'] ?? 'anon';
+  $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+  
+  attempt("login:{$ip}:{$userId}", 5, 900);
+  
+  Kelebihan:
+    ✓ Lebih fair (per user, bukan per IP)
+    ✓ Cegah satu user trial-and-error
+  
+  Kekurangan:
+    ✗ Jika belum login → user_id kosong, fallback ke IP
+
+
+IDENTIFIKASI TINGGI (IP + Email + Device Fingerprint):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  $email = hash('sha256', strtolower($_POST['email'] ?? ''));
+  $ip = SecurityHelper::clientIp(
+      trustProxy: true,
+      trustedCidrs: ['10.0.0.0/8', '103.21.244.0/22'] // Cloudflare
+  );
+  $fingerprint = hash('sha256', 
+      $_SERVER['HTTP_USER_AGENT'] . 
+      $_SERVER['HTTP_ACCEPT_LANGUAGE']
+  );
+  
+  attempt("login:{$ip}:{$email}:{$fingerprint}", 5, 900);
+  
+  Kelebihan:
+    ✓ Sangat akurat
+    ✓ Cegah brute-force sophisticated
+    ✓ Deteksi anomali
+  
+  Kekurangan:
+    ✗ Kompleks
+    ✗ False positive (user beli HP baru → device fingerprint berubah)
+
+
+TRUSTED PROXY (ANTI IP-SPOOFING):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  JANGAN percaya X-Forwarded-For tanpa verifikasi!
+  
+  BENAR:
+    $ip = SecurityHelper::clientIp(
+        trustProxy: true,
+        trustedCidrs: [
+            '127.0.0.1',           // nginx localhost
+            '10.0.0.0/8',          // internal network
+            '103.21.244.0/22',     // Cloudflare IP range
+        ]
+    );
+  
+  SALAH (berbahaya):
+    $ip = $_SERVER['HTTP_X_FORWARDED_FOR'];  // ✗ JANGAN
+  
+  Cara Kerja:
+    1. Cek REMOTE_ADDR (IP koneksi langsung)
+    2. Jika REMOTE_ADDR ada di trustedCidrs
+    3. Baru baca X-Forwarded-For
+    4. Jika tidak, tetap pakai REMOTE_ADDR
+
+================================================================================
+BAGIAN 8: MULTI-TIER RATE LIMITING
+================================================================================
+
+SINGLE-TIER (SEDERHANA):
+━━━━━━━━━━━━━━━━━━━━━━
+  $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+  if (!$limiter->attempt("api:{$ip}", 100, 60)) {
+      die("Rate limit exceeded");
+  }
+  
+  Masalah:
+    - Penyerang bisa pakai berbagai IP (botnet, proxy)
+    - Jika 1 IP sudah limit, pakai IP baru lagi
+    - Tidak ada deteksi pola serangan
+
+
+DUAL-TIER (RECOMMENDED UNTUK SEBAGIAN BESAR KASUS):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Tier 1 (Ketat): Per User
+    $userId = $_SESSION['user_id'] ?? 'anon';
+    if (!$limiter1->attempt("user:{$userId}", 5, 900)) {
+        die("Login tercoba 5x dalam 15 menit");
+    }
+  
+  Tier 2 (Agak Ketat): Per IP
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+    if (!$limiter2->attempt("ip:{$ip}", 50, 900)) {
+        die("IP tercoba > 50x dalam 15 menit");
+    }
+  
+  Contoh Skenario:
+    User A: 5 login gagal → Tier 1 limit tercapai ✓
+    User B (IP sama): 1 login gagal → Tier 1 OK, Tier 2 OK ✓
+    User C (IP sama): 1 login gagal → Tier 1 OK, Tier 2 OK ✓
+    ...
+    10 user (IP sama): 45 login gagal → Tier 2 limit tercapai!
+    
+  Keuntungan:
+    ✓ Cegah brute-force per user
+    ✓ Deteksi serangan dari 1 IP dengan banyak akun
+
+
+TRI-TIER (UNTUK KEAMANAN CRITICAL):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Tier 1 (Paling Ketat): Per User
+    if (!$limiter1->attempt("user:{$userId}", 3, 300)) {
+        recordSecurityEvent('brute_force_user', $userId);
+        die("Akun dikunci 5 menit");
+    }
+  
+  Tier 2 (Sedang): Per IP
+    if (!$limiter2->attempt("ip:{$ip}", 20, 300)) {
+        recordSecurityEvent('brute_force_ip', $ip);
+        die("IP terblokir 5 menit");
+    }
+  
+  Tier 3 (Global): Seluruh Endpoint
+    if (!SecurityHelper::globalAttempt($limiter3, 'login', 100, 300)) {
+        recordSecurityEvent('massive_attack');
+        http_response_code(503);
+        die("Sistem sedang di-maintenance");
+    }
+  
+  Keuntungan:
+    ✓ Deteksi botnet (1 user × 100 IP)
+    ✓ Deteksi DDoS (banyak IP, banyak akun)
+    ✓ Emergency circuit breaker di global
+
+
+CONTOH IMPLEMENTASI DUAL-TIER (CODE):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  <?php
+  require_once __DIR__ . '/autoload.php';
+  use RateLimiter\RateLimiter;
+  use RateLimiter\FileStorage;
+  
+  $storage = new FileStorage(__DIR__ . '/temp');
+  
+  // Tier 1: timestamp (ketat)
+  $tier1 = new RateLimiter($storage, ['algorithm' => 'timestamp']);
+  
+  // Tier 2: dual-counter (lebih ringan)
+  $tier2 = new RateLimiter($storage, ['algorithm' => 'dual-counter']);
+  
+  $userId = $_SESSION['user_id'] ?? 'anon';
+  $email = strtolower($_POST['email'] ?? '');
+  $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+  
+  // Check Tier 1: Per (IP + email)
+  $tier1Key = "login:{$ip}:" . hash('sha256', $email);
+  if (!$tier1->attempt($tier1Key, 5, 900)) {
+      http_response_code(429);
+      echo "Terlalu banyak percobaan login. Tunggu " . 
+           $tier1->getRetryAfter() . " detik.";
+      exit;
+  }
+  
+  // Check Tier 2: Per IP saja (untuk deteksi attack)
+  if (!$tier2->attempt("ip:{$ip}", 50, 900)) {
+      http_response_code(429);
+      echo "IP Anda memiliki terlalu banyak aktivitas mencurigakan.";
+      exit;
+  }
+  
+  // Proses login normal
+  $valid = cekKredensial($email, $_POST['password'] ?? '');
+  if ($valid) {
+      $tier1->reset($tier1Key);  // Reset setelah sukses
+      $tier2->reset("ip:{$ip}");
+      session_regenerate_id(true);
+      header('Location: /dashboard');
+  } else {
+      echo "Username/password salah";
+  }
+
+================================================================================
+BAGIAN 9: CHECKLIST IMPLEMENTASI
+================================================================================
+
+UNTUK DEVELOPMENT:
+  ☐ Paham 2 algoritma (timestamp vs dual-counter)
+  ☐ Paham Solusi 2 (key isolation)
+  ☐ Paham multi-tier limiting
+  ☐ Bisa memilih storage yang tepat
+  ☐ Bisa setup cron-gc.php
+  ☐ Bisa menduplikasi demo dan edit DEMO_KEY_PREFIX
+
+UNTUK PRODUCTION:
+  ☐ Gunakan Redis (atau HybridStorage dengan Redis)
+  ☐ Setup cron-gc.php setiap 5 menit
+  ☐ Monitoring: cek folder temp/violations, Redis memory
+  ☐ Logging: cek error_log untuk block/unblock events
+  ☐ Testing: run ./test.php harus semua lulus
+  ☐ Trusted proxy: setup SecurityHelper::clientIp() dengan CIDR
+  ☐ Multi-tier: minimal 2 tier untuk login (user + IP)
+
+================================================================================
+BAGIAN 10: DEBUGGING & TROUBLESHOOTING
+================================================================================
+
+ERROR: Fatal Error: array_filter(): Argument #1 ($array) must be of type array, null given
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Penyebab: Timestamp membaca data dual-counter (atau sebaliknya)
+  Solusi: 
+    1. Verifikasi setiap file punya DEMO_KEY_PREFIX berbeda
+    2. Hapus folder /temp/
+    3. Coba ulang
+
+ERROR: Rate limit tidak akurat di multi-server
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Penyebab: Pakai FileStorage (tidak shared antar server)
+  Solusi: Gunakan RedisStorage atau HybridStorage
+
+ERROR: Data menumpuk di /temp/
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Penyebab: Traffic rendah, GC probabilistik jarang jalan
+  Solusi: Setup cron-gc.php setiap 5 menit
+    */5 * * * * php /path/to/cron-gc.php
+
+ERROR: Sisa kuota bertambah sendiri (dual-counter)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Penyebab: Dual-counter by design (estimasi, bukan akurat)
+  Solusi: Jika butuh akurat, gunakan timestamp
+
+DEBUG: Lihat isi counter di storage
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FileStorage:
+    cat /path/to/temp/demo1_sha256_xxx.json
+  
+  Redis:
+    redis-cli
+    > KEYS "demo1:*"
+    > GET "demo1:sha256(...)"
+
+================================================================================
+BAGIAN 11: QUICK START UNTUK AI BARU
+================================================================================
+
+1. COPY SECTION INI KE PROMPT AI BARU
+
+2. JELASKAN TUJUAN ANDA, CONTOH:
+   "Saya ingin menambahkan rate limiting ke endpoint /api/search
+    dengan parameter: user_id, limit=200 req/menit, algoritma=dual-counter"
+
+3. AI AKAN MEMBANTU DENGAN:
+   - Memilih identifier yang tepat (user_id, IP, atau kombinasi)
+   - Memilih algoritma yang tepat
+   - Menulis kode implementasi
+   - Troubleshoot error
+   - Optimize performance
+
+4. CONTOH PROMPT UNTUK AI:
+   
+   "Berdasarkan PHP Rate Limiter Library yang sudah dijelaskan,
+    tolong buatkan kode untuk:
+    
+    Endpoint: POST /api/artikel/simpan
+    Identifikasi: User ID (dari JWT token)
+    Limit: 10 artikel per jam
+    Algoritma: timestamp (karena sensitive action)
+    Storage: FileStorage di /tmp/rl
+    Respons error: JSON 429 dengan field retry_after
+    
+    Gunakan library RateLimiter yang sudah dijelaskan."
+
+================================================================================
+BAGIAN 12: REFERENCE CEPAT — COPY PASTE
+================================================================================
+
+SETUP FILESTORAGE:
+━━━━━━━━━━━━━━━━
+  <?php
+  require_once __DIR__ . '/autoload.php';
+  use RateLimiter\RateLimiter;
+  use RateLimiter\FileStorage;
+  
+  $storage = new FileStorage(__DIR__ . '/temp', gcDivisor: 50, maxFiles: 5000);
+  $limiter = new RateLimiter($storage, ['algorithm' => 'timestamp']);
+
+SETUP REDISSTORAGE:
+━━━━━━━━━━━━━━━━
+  <?php
+  require_once __DIR__ . '/autoload.php';
+  use RateLimiter\RateLimiter;
+  use RateLimiter\RedisStorage;
+  
+  $redis = new Redis();
+  $redis->connect('127.0.0.1', 6379);
+  $storage = new RedisStorage($redis);
+  $limiter = new RateLimiter($storage, ['algorithm' => 'dual-counter']);
+
+SETUP HYBRIDSTORAGE:
+━━━━━━━━━━━━━━━━━━
+  <?php
+  require_once __DIR__ . '/autoload.php';
+  use RateLimiter\RateLimiter;
+  use RateLimiter\RedisStorage;
+  use RateLimiter\FileStorage;
+  use RateLimiter\HybridStorage;
+  
+  $redis = new Redis();
+  $redis->connect('127.0.0.1', 6379);
+  
+  $storage = new HybridStorage(
+      primary: new RedisStorage($redis),
+      fallback: new FileStorage('/var/tmp/rl'),
+      onDegrade: fn() => error_log('Redis down'),
+      onRecover: fn() => error_log('Redis up'),
+      retryInterval: 30
+  );
+  $limiter = new RateLimiter($storage, ['algorithm' => 'dual-counter']);
+
+SIMPLE ATTEMPT (SINGLE TIER):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+  if (!$limiter->attempt("api:{$ip}", 100, 60)) {
+      http_response_code(429);
+      die(json_encode(['error' => 'Rate limit exceeded']));
+  }
+
+DUAL TIER (USER + IP):
+━━━━━━━━━━━━━━━━━━━
+  $userId = $_SESSION['user_id'] ?? 'anon';
+  $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+  
+  // Tier 1: Per user
+  if (!$limiter->attempt("user:{$userId}", 5, 900)) {
+      http_response_code(429);
+      die('User limit exceeded');
+  }
+  
+  // Tier 2: Per IP
+  if (!$limiter->attempt("ip:{$ip}", 50, 900)) {
+      http_response_code(429);
+      die('IP limit exceeded');
+  }
+
+GET HEADER UNTUK RESPONSE:
+━━━━━━━━━━━━━━━━━━━━━━━━
+  $headers = $limiter->getHeaders(limit: 100, debug: false);
+  // Output: ['X-RateLimit-Limit' => 100, 'X-RateLimit-Remaining' => 85, ...]
+  
+  foreach ($headers as $key => $value) {
+      header("{$key}: {$value}");
+  }
+
+CEGAH IP SPOOFING (TRUSTED PROXY):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  $ip = RateLimiter::clientIp(
+      trustProxy: true,
+      trustedCidrs: ['103.21.244.0/22', '10.0.0.0/8']
+  );
+
+ANTI BOTNET (GLOBAL LIMIT):
+━━━━━━━━━━━━━━━━━━━━━━━━
+  use RateLimiter\SecurityHelper;
+  
+  if (!SecurityHelper::globalAttempt($limiter, 'login', 1000, 300)) {
+      http_response_code(503);
+      die('Service temporarily unavailable');
+  }
+
+RESET SETELAH SUKSES:
+━━━━━━━━━━━━━━━━━━━
+  if (loginSuccessful()) {
+      $limiter->reset("user:{$userId}");
+      $limiter->reset("ip:{$ip}");
+  }
+
+BLOKIR MANUAL:
+━━━━━━━━━━━━
+  if (detectedFraud($userId)) {
+      $limiter->block("user:{$userId}", seconds: 3600);  // 1 jam
+  }
+  
+  if ($limiter->isBlocked("user:{$userId}")) {
+      die('Your account is temporarily blocked');
+  }
+
+================================================================================
+BAGIAN 13: TEST & VALIDATION
+================================================================================
+
+RUN TEST SUITE:
+━━━━━━━━━━━━━
+  php test.php
+  
+  Expected: 195/195 PASS
+  Jika gagal: cek error message, biasanya issue di storage setup
+
+VALIDATE PRODUCTION SETUP:
+━━━━━━━━━━━━━━━━━━━━━━
+  1. Redis running?
+     redis-cli ping
+  
+  2. Folder /temp/ bisa ditulis?
+     touch /path/to/temp/test.txt
+  
+  3. cron-gc.php executable?
+     php cron-gc.php --dry-run
+  
+  4. Test limiter dengan curl?
+     for i in {1..10}; do
+       curl http://localhost/api/test
+       echo "Request $i"
+     done
+     
+     Harapan: Request 6+ return 429 jika limit 5
+
+MONITORING:
+━━━━━━━━━━
+  - Cek /var/log/rl-gc.log untuk GC output
+  - Cek PHP error_log untuk [RateLimiter:BLOCK] events
+  - Cek Redis memory usage (redis-cli INFO memory)
+  - Cek folder size (/temp/ tidak > 500MB)
+
+================================================================================
+BAGIAN 14: NOTES UNTUK AI ASSISTANT
+================================================================================
+
+KETIKA USER MENANYAKAN HAL-HAL INI:
+
+Q: "Saya mau bikin endpoint yang SANGAT sensitive (transfer uang)"
+A: Gunakan TIMESTAMP + MULTI-TIER (user + IP + global)
+   Limit: 3 per jam per user, 50 per jam per IP
+   Identifier: user_id + hash(email)
+
+Q: "Saya punya API public yang traffic tinggi (>1000 req/menit)"
+A: Gunakan DUAL-COUNTER + REDIS
+   Jangan pakai FileStorage (akan bottleneck)
+   Setup HybridStorage dengan fallback ke FileStorage
+
+Q: "User saya pakai VPN/Proxy, IP selalu berubah"
+A: Gunakan USER_ID sebagai primary identifier, bukan IP
+   IP hanya sebagai secondary identifier (untuk deteksi anomali)
+   Jika belum login, pakai Device Fingerprint
+
+Q: "File saya demo.php, demo2.php, demo3.php saling tabrakan"
+A: Gunakan DEMO_KEY_PREFIX berbeda di setiap file
+   File demo.php: const DEMO_KEY_PREFIX = 'demo1';
+   File demo2.php: const DEMO_KEY_PREFIX = 'demo2';
+   File demo3.php: const DEMO_KEY_PREFIX = 'demo3';
+
+Q: "Saya tidak perlu rate limiting di endpoint tertentu"
+A: Tidak perlu paksa. Tapi pertimbangkan:
+   - Search/filter public? → Perlu (anti-scraping)
+   - File download public? → Perlu (anti-bandwidth theft)
+   - Internal API hanya? → Mungkin tidak perlu (if behind firewall)
+   - Form submission? → Pasti perlu (anti-spam)
+
+Q: "Berapa limit yang ideal untuk endpoint X?"
+A: Rule of thumb:
+   - Login: 5 per 15 menit
+   - Form submit: 10 per menit
+   - API read: 100-1000 per menit (tergantung traffic)
+   - File upload: 3 per 5 menit
+   - Search: 200 per menit (prevent scraping)
+   - Public download: 20 per menit (prevent bandwidth theft)
+
+================================================================================
+BAGIAN 15: LINK DAN REFERENSI
+================================================================================
+
+DOKUMENTASI LENGKAP:
+  File: RateLimiter-Dokumentasi.docx (195 halaman)
+  Isi: Setup, CRUD natif, CRUD API, troubleshooting, quick ref
+
+CODE REFERENCE:
+  Main: /src/RateLimiter.php (619 lines, well-documented)
+  Storage: /src/Storage.php (semua 5 driver)
+  Helper: /src/SecurityHelper.php (IP normalization, CIDR, etc)
+
+TESTING:
+  File: test.php (195 test, 31 suites)
+  Coverage: Semua algoritma, storage, multi-tier, edge cases
+
+DEMO INTERAKTIF:
+  File: demo.php (4 tab: login, kontak, API, dashboard)
+  Fitur: Pilih algoritma per tab, lihat counter real-time
+
+SETUP PRODUCTION:
+  cron-gc.php (garbage collector CLI)
+  Setup di crontab: */5 * * * * php /path/to/cron-gc.php
+
+================================================================================
+BAGIAN 16: BEST PRACTICES
+================================================================================
+
+JANGAN:
+  ✗ Pakai hanya IP untuk identifier (NAT problem)
+  ✗ Percaya X-Forwarded-For tanpa cek REMOTE_ADDR
+  ✗ Pakai timestamp untuk limit > 500
+  ✗ Pakai FileStorage untuk traffic > 500 req/menit
+  ✗ Skip cron-gc.php (file akan menumpuk)
+  ✗ Hardcode limit, gunakan config file
+  ✗ Lupa reset() setelah login sukses
+  ✗ Setup 1 tier saja untuk keamanan critical
+
+LAKUKAN:
+  ✓ Gunakan 2-3 tier identifier (user + IP + global)
+  ✓ Cek trusted CIDR jika pakai proxy
+  ✓ Pilih algoritma sesuai use case
+  ✓ Setup cron-gc.php untuk maintenance
+  ✓ Monitoring dan logging
+  ✓ Test thoroughly sebelum deploy
+  ✓ Dokumentasi alasan setiap limit
+  ✓ Review limit secara berkala
+
+MONITORING CHECKLIST:
+  Weekly:
+    - Cek /var/log/rl-gc.log tidak ada error
+    - Cek Redis memory < 1GB
+    - Cek folder /temp/ size < 500MB
+  
+  Monthly:
+    - Review dan adjust limit berdasarkan traffic pattern
+    - Analisis [RateLimiter:BLOCK] events (ada serangan?)
+    - Test failover (matiin Redis, verifikasi fallback jalan)
+  
+  Setiap Deploy:
+    - Run test.php, harus 195/195 lulus
+    - Test endpoint dengan curl (verifikasi rate limit jalan)
+
+================================================================================
+BAGIAN 17: TERAKHIR — UNTUK AI BARU
+================================================================================
+
+Jika Anda adalah AI baru yang membaca dokumentasi ini:
+
+1. PAHAMI KONSEP FUNDAMENTAL:
+   - Rate Limiter = counter dengan window waktu
+   - Dua algoritma: timestamp (akurat) vs dual-counter (cepat)
+   - Solusi 2 = isolasi key per algoritma (mencegah tabrakan)
+   - Multi-tier = layer keamanan berlapis
+
+2. SAAT USER MENANYAKAN SOMETHING NEW:
+   - Lihat bagian "NOTES UNTUK AI ASSISTANT"
+   - Berikan rekomendasi algoritma + identifier + limit
+   - Tulis kode menggunakan library RateLimiter
+   - Jelaskan trade-off dan mengapa pilihan itu
+
+3. JIKA USER INGIN EXTEND/MODIFY:
+   - Review class structure di bagian "CORE CLASSES"
+   - Lihat test.php untuk understanding behavior
+   - Modifikasi dengan hati-hati, test semua 195 case
+   - Update dokumentasi setelah perubahan
+
+4. JIKA STUCK/CONFUSED:
+   - Reference "QUICK START UNTUK AI BARU" (bagian 11)
+   - Baca "TROUBLESHOOTING" (bagian 10)
+   - Lihat contoh kode di bagian 12
+   - Tanya user untuk clarifikasi
+
+================================================================================
+END OF DOCUMENT
+================================================================================
+
+Document Version: 1.0
+Last Updated: April 18, 2026
+Framework Version: Solusi 2 (Key Isolation per Algoritma)
+Test Coverage: 195/195 passing
+
+Catatan: Dokumentasi ini dapat di-update seiring dengan perkembangan
+framework. Untuk versi terbaru, lihat folder /outputs/RateLimiter/.
